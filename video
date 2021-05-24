@@ -1,0 +1,231 @@
+#!/bin/bash
+# Easy to use script for most common ffmpeg video editing tasks.
+#
+# Copyright (c) 2021 Antonio Bonifati.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+me=$(basename "$0")
+
+usage() {
+  echo "Usage: $me subcommand... [arg]... [, subcommand... [arg]...]"
+}
+
+error() {
+  echo "$me: unknown subcommand $cmd"
+  exit 1
+}
+
+if [[ $# == 0 ]]; then
+  usage
+  echo "For more info use help as a first subcommand"
+  exit 1
+fi
+
+while [[ $# > 0 ]]; do
+  if [[ "$1" == "," ]]; then
+    shift
+  fi
+
+  cmd="$1"
+
+  case "$cmd" in
+    h*) usage
+        cat << EOF
+TIME format is HH:MM:SS.xxx or s.msec
+Subcommands (can be shortened):
+
+yes       (no overwrite confirmation)
+no        (overwrite confirmation)
+audio     extract in out
+          replace in audio out -shortest
+concat    in... out
+cut	  in start out [end|+duration] -precise
+info      in
+transpose in cclock_flip|clock|cclock|clock_flip out
+segment	  in [outbasename]
+title     image duration out [size] [framerate]
+video	  extract in out
+          speed in fraction out [duration]
+EOF
+      exit 0
+      ;;
+
+    a*) shift
+      cmd="$1"
+      case "$cmd" in
+        e*) echo "$me: extracting audio"
+          ffmpeg $Y -i "$2" -vn -acodec copy "$3"
+          shift 3
+        ;;
+
+        r*) echo "$me: replacing audio"
+          ffmpeg $Y -i "$2" -i "$3" -c copy -map 0:v:0 -map 1:a:0 $5 "$4"
+          shift 4
+        ;;
+
+        *) error;;
+      esac
+      ;;
+
+    co*) # https://trac.ffmpeg.org/wiki/Concatenate
+
+         shift
+         # To correctly handle file names with embedded spaces
+         OLDIFS=$IFS
+         IFS=$'\n'
+
+         files=( "$@" )
+         out=${files[@]:(-1)}
+         unset "files[${#files[@]}-1]"
+         # Now files is only input files and out is the last output file
+
+         allmp4=true
+         for f in "${files[@]}"; do
+           if [ "${f: -4}" != ".mp4" ]; then
+             allmp4=false
+             break
+           fi
+         done
+
+         if [ "$allmp4" = true ] ; then
+           n=${#files[@]}
+           pipes=()
+           for f in $(seq 1 $n); do
+             pipes+=("$(mktemp)")
+           done
+
+           for f in $(seq 0 $(($n - 1))); do
+             p=$(($f + 1))
+             ffmpeg -y -i "${!p}" -c copy -bsf:v h264_mp4toannexb -f mpegts ${pipes[$f]} \
+               2> /dev/null || { echo 'mp4 concat failed' ; exit 1; }
+           done
+
+           # Pass the list of files to concatenate on the fly
+           ffmpeg $Y -f mpegts -i $(realpath "${pipes[@]}" \
+             | awk '{ if (NR==1) print "concat:"$0; else print}' \
+             | paste -sd'|') -c copy -bsf:a aac_adtstoasc "$out"
+         else
+           ffmpeg $Y -f concat -safe 0 -i <(realpath "${files[@]}" \
+             | awk '{print "file '"'"'"$0"'"'"'"}') -c copy "$out" 
+         fi
+
+         IFS=$OLDIFS
+         shift $#
+      ;;
+
+    cu*) if [[ "$5" ]]; then 
+          if [[ "${5:0:1}" == "+" ]]; then
+            dur="${5:1}"
+            if [[ "$6" == "-precise" ]]; then
+              echo "$me: precisely cutting from $3 + $dur"
+              ffmpeg $Y -ss "$3" -i "$2" -t "$dur" "$4"
+              shift 6
+            else
+              echo "$me: cutting from $3 + $dur"
+              ffmpeg $Y -ss "$3" -i "$2" -c copy -t "$dur" "$4"
+              shift 5
+            fi
+          elif [[ "$6" == "-precise" ]]; then
+            echo "$me: precisely cutting from $3 to $5"
+            ffmpeg $Y -ss "$3" -to "$5" -i "$2" "$4"
+            shift 6
+          else
+            echo "$me: cutting from $3 to $5"
+            ffmpeg $Y -ss "$3" -to "$5" -i "$2" -c copy "$4"
+            shift 5
+          fi
+        else
+          if [[ "$5" == "-precise" ]]; then
+           echo "$me: precisely cutting from $3"
+            ffmpeg $Y -ss "$3" -i "$2" "$4"
+            shift 5
+          else
+            echo "$me: cutting from $3"
+            ffmpeg $Y -ss "$3" -i "$2" -c copy "$4"
+            shift 4
+          fi
+        fi
+      ;;
+
+    i*) ffprobe "$2"
+        shift 2
+      ;;
+
+    n*) Y=
+      shift
+      ;;
+
+    s*) echo "$me: split into numbered segments based on key frames"
+        ffmpeg $Y -i "$2" -acodec copy -f segment -vcodec copy -reset_timestamps 1 -map 0 "$3%04d".${2##*.}
+        shift 3
+      ;;
+
+    ti*) echo "$me: generating $3s title clip from $2"
+      if [[ "$6" ]]; then
+        ffmpeg $Y -framerate "$6" -loop 1 -i "$2" -c:v libx264 -t "$3" -pix_fmt yuv420p -vf scale="$5" "$4"
+        shift 6
+      elif [[ "$5" ]]; then
+        ffmpeg $Y -loop 1 -i "$2" -c:v libx264 -t "$3" -pix_fmt yuv420p -vf scale="$5" "$4"
+        shift 5
+      else
+        ffmpeg $Y -loop 1 -i "$2" -c:v libx264 -t "$3" -pix_fmt yuv420p "$4"
+        shift 4
+      fi
+      ;;
+
+    tr*) echo "$me: $3 transposing"
+         # Rotation metadata must be cleared else transposing may not work as expected
+         # (the aspect ration won't be inverted)
+
+         # TODO: use ExifTool (exiftool.org) and not FFmpeg for changing metadata.
+         # It's easy to use, faster and has option for overwriting the original file
+         TMP=$(mktemp -p . --suffix=."${2##*.}")
+         ffmpeg -y -i "$2" -c copy -metadata:s:v:0 rotate=0 "$TMP"
+
+         ffmpeg $Y -i "$TMP" -vf "transpose=$3" -c:a copy "$4"
+
+         rm "$TMP"
+         shift 4
+      ;;
+
+    v*) shift
+      cmd="$1"
+      case "$cmd" in
+        e*) echo "$me: extracting video"
+          ffmpeg $Y -i "$2" -c copy -an "$3"
+          shift 3
+          ;;
+
+        s*) echo "$me: changing video speed"
+          if [[ "$5" ]]; then
+            ffmpeg $Y -i "$2" -filter:v "setpts=$3*PTS" -t "$5" "$4"
+            shift 5
+          else
+            ffmpeg $Y -i "$2" -filter:v "setpts=$3*PTS" "$4"
+            shift 4
+          fi
+          ;;
+
+        *) error;;
+      esac
+      ;;
+
+    y*) Y=-y
+      shift
+      ;;
+
+    *) error ;;
+  esac
+done
